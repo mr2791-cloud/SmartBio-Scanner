@@ -157,14 +157,12 @@ def read_barcode(image_data):
 initialize_database()
 
 
-# =====================================
-# 5. SIDEBAR
-# =====================================
+# MOBILE NAVIGATION
 
-st.sidebar.title("🧬 BioScan")
+st.markdown("### 🧬 BioScan Navigation")
 
-page = st.sidebar.radio(
-    "MAIN MENU",
+page = st.radio(
+    "Choose a section",
     [
         "Dashboard",
         "QR / Barcode Scanner",
@@ -172,8 +170,13 @@ page = st.sidebar.radio(
         "Biological Database",
         "Scan History",
         "About Project"
-    ]
+    ],
+    horizontal=True,
+    label_visibility="collapsed"
 )
+
+st.divider()
+
 
 
 # =====================================
