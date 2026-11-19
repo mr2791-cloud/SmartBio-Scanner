@@ -1,24 +1,22 @@
-
 import streamlit as st
-import sqlite3
 import pandas as pd
-import zxingcpp
-
+import sqlite3
+import requests
+import qrcode
+import io
 from PIL import Image
-from io import BytesIO
-from datetime import datetime
+from urllib.parse import quote
 
-hide_streamlit_style = """
-<style>
-#MainMenu {visibility: hidden;}
-footer {visibility: hidden;}
-header {visibility: hidden;}
-</style>
-"""
-st.markdown(hide_streamlit_style, unsafe_allow_html=True)
-# =====================================
-# 1. APPLICATION CONFIGURATION
-# =====================================
+try:
+    import zxingcpp
+    SCANNER_AVAILABLE = True
+except ImportError:
+    SCANNER_AVAILABLE = False
+
+
+# -------------------------------
+# إعداد التطبيق
+# -------------------------------
 
 st.set_page_config(
     page_title="BioScan Intelligence",
@@ -26,437 +24,704 @@ st.set_page_config(
     layout="wide"
 )
 
-DB = "bioscan.db"
+DB_NAME = "bioscan.db"
 
 
-# =====================================
-# 2. DATABASE MANAGEMENT
-# =====================================
+# -------------------------------
+# قاعدة بيانات المركبات: 100 مركب
+# -------------------------------
 
-def connect():
-    return sqlite3.connect(DB)
-
-
-def initialize_database():
-
-    with connect() as conn:
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS samples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE NOT NULL,
-                name TEXT NOT NULL,
-                category TEXT,
-                source TEXT,
-                description TEXT,
-                created_at TEXT
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS scan_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT,
-                format TEXT,
-                scan_date TEXT
-            )
-        """)
-
-
-def add_sample(code, name, category, source, description):
-
-    if not code.strip() or not name.strip():
-        raise ValueError("Sample code and name are required.")
-
-    with connect() as conn:
-
-        conn.execute("""
-            INSERT INTO samples
-            (code, name, category, source, description, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (
-            code.strip(),
-            name.strip(),
-            category,
-            source,
-            description,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
+COMPOUNDS = {
+    "Organic Chemistry": [
+        "Methane", "Ethane", "Propane", "Butane",
+        "Ethene", "Propene", "Ethyne", "Benzene",
+        "Toluene", "Phenol", "Aniline", "Methanol",
+        "Ethanol", "Propanol", "Acetone", "Formaldehyde",
+        "Acetaldehyde", "Acetic acid", "Formic acid",
+        "Benzoic acid", "Oxalic acid", "Citric acid",
+        "Glucose", "Fructose", "Sucrose", "Lactose",
+        "Starch", "Cellulose", "Urea", "Glycine",
+        "Alanine", "Glycerol", "Ethyl acetate",
+        "Chloroform", "Dichloromethane", "Naphthalene",
+        "Cyclohexane", "Pyridine", "Aspirin", "Paracetamol"
+    ],
+    "Inorganic Chemistry": [
+        "Water", "Sodium chloride", "Hydrochloric acid",
+        "Sulfuric acid", "Nitric acid", "Phosphoric acid",
+        "Sodium hydroxide", "Potassium hydroxide",
+        "Calcium hydroxide", "Ammonia", "Sodium bicarbonate",
+        "Sodium carbonate", "Calcium carbonate",
+        "Magnesium sulfate", "Copper sulfate",
+        "Iron(III) chloride", "Potassium permanganate",
+        "Potassium dichromate", "Hydrogen peroxide",
+        "Sodium nitrate", "Potassium nitrate",
+        "Calcium chloride", "Silver nitrate",
+        "Sodium phosphate", "Magnesium chloride",
+        "Aluminum oxide", "Silicon dioxide",
+        "Carbon dioxide", "Sulfur dioxide", "Oxygen"
+    ],
+    "Biochemistry": [
+        "ATP", "ADP", "AMP", "DNA",
+        "RNA", "Glycine", "Alanine", "Valine",
+        "Leucine", "Lysine", "Glutamic acid",
+        "Aspartic acid", "Serine", "Threonine",
+        "Cysteine", "Methionine", "Tryptophan",
+        "Tyrosine", "Phenylalanine", "Histidine",
+        "Ribose", "Deoxyribose", "Cholesterol",
+        "Palmitic acid", "Oleic acid", "Lactic acid",
+        "Pyruvic acid", "Glycogen", "Maltose", "FAD"
+    ]
+}
 
 
-def find_sample(code):
+# -------------------------------
+# إنشاء الجداول
+# -------------------------------
 
-    with connect() as conn:
+def connect_db():
+    return sqlite3.connect(DB_NAME, check_same_thread=False)
 
-        result = conn.execute(
-            "SELECT * FROM samples WHERE code = ?",
-            (code.strip(),)
-        ).fetchone()
 
+def setup_database():
+    conn = connect_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS compounds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE,
+            category TEXT,
+            formula TEXT,
+            molecular_weight TEXT,
+            smiles TEXT,
+            cid TEXT,
+            description TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_name TEXT,
+            sample_code TEXT,
+            notes TEXT
+        )
+    """)
+
+    for category, names in COMPOUNDS.items():
+        for name in names:
+            cur.execute("""
+                INSERT OR IGNORE INTO compounds
+                (name, category)
+                VALUES (?, ?)
+            """, (name, category))
+
+    conn.commit()
+    conn.close()
+
+
+setup_database()
+
+
+# -------------------------------
+# قراءة قاعدة البيانات
+# -------------------------------
+
+def get_compounds():
+    conn = connect_db()
+    df = pd.read_sql_query(
+        "SELECT * FROM compounds ORDER BY category, name",
+        conn
+    )
+    conn.close()
+    return df
+
+
+def get_compound(compound_id):
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM compounds WHERE id = ?",
+        (compound_id,)
+    )
+    result = cur.fetchone()
+    conn.close()
     return result
 
 
-def get_samples(search=""):
+# -------------------------------
+# جلب بيانات PubChem
+# -------------------------------
 
-    with connect() as conn:
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_pubchem_data(name):
+    try:
+        url = (
+            "https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
+            f"compound/name/{quote(name)}/property/"
+            "MolecularFormula,MolecularWeight,CanonicalSMILES,"
+            "IUPACName/JSON"
+        )
 
-        return pd.read_sql_query("""
-            SELECT * FROM samples
-            WHERE code LIKE ?
-            OR name LIKE ?
-            OR category LIKE ?
-            ORDER BY id DESC
-        """, conn, params=(f"%{search}%",) * 3)
+        response = requests.get(url, timeout=15)
 
+        if response.status_code != 200:
+            return None
 
-def record_scan(code, barcode_format):
+        data = response.json()
+        properties = data["PropertyTable"]["Properties"][0]
 
-    with connect() as conn:
+        cid = str(properties.get("CID", ""))
 
-        conn.execute("""
-            INSERT INTO scan_history
-            (code, format, scan_date)
-            VALUES (?, ?, ?)
-        """, (
-            code,
-            barcode_format,
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ))
+        return {
+            "formula": properties.get("MolecularFormula", ""),
+            "weight": str(properties.get("MolecularWeight", "")),
+            "smiles": properties.get("ConnectivitySMILES", ""),
+            "iupac": properties.get("IUPACName", ""),
+            "cid": cid
+        }
 
-
-# =====================================
-# 3. QR AND BARCODE READER
-# =====================================
-
-def read_barcode(image_data):
-
-    image = Image.open(
-        BytesIO(image_data)
-    ).convert("RGB")
-
-    results = zxingcpp.read_barcodes(image)
-
-    decoded = []
-
-    for result in results:
-
-        if result.text.strip():
-
-            decoded.append({
-                "code": result.text.strip(),
-                "format": str(result.format)
-            })
-
-    return decoded
+    except Exception:
+        return None
 
 
-# =====================================
-# 4. INITIALIZE
-# =====================================
+def save_pubchem_data(compound_id, data):
+    conn = connect_db()
+    cur = conn.cursor()
 
-initialize_database()
+    cur.execute("""
+        UPDATE compounds
+        SET formula = ?,
+            molecular_weight = ?,
+            smiles = ?,
+            cid = ?,
+            description = ?
+        WHERE id = ?
+    """, (
+        data["formula"],
+        data["weight"],
+        data["smiles"],
+        data["cid"],
+        data["iupac"],
+        compound_id
+    ))
+
+    conn.commit()
+    conn.close()
 
 
-# MOBILE NAVIGATION
+# -------------------------------
+# واجهة التطبيق
+# -------------------------------
 
-st.markdown("### 🧬 BioScan Navigation")
-
-page = st.radio(
-    "Choose a section",
-    [
-        "Dashboard",
-        "QR / Barcode Scanner",
-        "Register Sample",
-        "Biological Database",
-        "Scan History",
-        "About Project"
-    ],
-    horizontal=True,
-    label_visibility="collapsed"
-)
+st.title("🧬 BioScan Intelligence")
+st.caption("Educational Chemical & Biochemical Compound Platform")
 
 st.divider()
 
-
-
-# =====================================
-# 6. DASHBOARD
-# =====================================
-
-st.title("🧬 BioScan Intelligence")
-
-st.caption(
-    "Smart Biological Sample Identification System"
+page = st.radio(
+    "القائمة الرئيسية",
+    [
+        "Dashboard",
+        "Compound Database",
+        "Compound Details",
+        "Add Compound",
+        "QR Generator",
+        "QR / Barcode Scanner",
+        "Import CSV",
+        "Biological Samples"
+    ],
+    horizontal=False
 )
+
+
+# -------------------------------
+# Dashboard
+# -------------------------------
 
 if page == "Dashboard":
 
-    st.header("Research Dashboard")
+    df = get_compounds()
 
-    with connect() as conn:
+    st.header("📊 Dashboard")
 
-        total_samples = conn.execute(
-            "SELECT COUNT(*) FROM samples"
-        ).fetchone()[0]
+    col1, col2, col3 = st.columns(3)
 
-        total_scans = conn.execute(
-            "SELECT COUNT(*) FROM scan_history"
-        ).fetchone()[0]
-
-    col1, col2 = st.columns(2)
-
-    col1.metric(
-        "Registered Samples",
-        total_samples
-    )
-
+    col1.metric("Total Compounds", len(df))
     col2.metric(
-        "Total Scans",
-        total_scans
+        "Organic",
+        len(df[df["category"] == "Organic Chemistry"])
+    )
+    col3.metric(
+        "Biochemistry",
+        len(df[df["category"] == "Biochemistry"])
     )
 
-    st.divider()
+    st.subheader("Compound Categories")
 
-    st.info(
-        "Use the scanner to identify registered sample codes "
-        "or register a new biological sample."
+    category_counts = (
+        df["category"].value_counts().reset_index()
+    )
+    category_counts.columns = ["Category", "Count"]
+
+    st.bar_chart(
+        category_counts.set_index("Category")
+    )
+
+    st.subheader("Recently Added Compounds")
+    st.dataframe(
+        df[["id", "name", "category", "formula"]].tail(10),
+        use_container_width=True
     )
 
 
-# =====================================
-# 7. QR / BARCODE SCANNER
-# =====================================
+# -------------------------------
+# قاعدة بيانات المركبات
+# -------------------------------
 
-elif page == "QR / Barcode Scanner":
+elif page == "Compound Database":
 
-    st.header("📷 Biological Sample Scanner")
+    st.header("🧪 Chemical Compound Database")
 
-    uploaded = st.file_uploader(
-        "Upload QR / Barcode Image",
-        type=["png", "jpg", "jpeg", "bmp", "webp"]
+    df = get_compounds()
+
+    search = st.text_input(
+        "ابحث باسم المركب أو الصيغة أو SMILES"
     )
 
-    camera = st.camera_input(
-        "Capture barcode using camera"
+    category = st.selectbox(
+        "اختر القسم",
+        [
+            "All Categories",
+            "Organic Chemistry",
+            "Inorganic Chemistry",
+            "Biochemistry"
+        ]
     )
 
-    image_file = camera if camera is not None else uploaded
+    if category != "All Categories":
+        df = df[df["category"] == category]
 
-    if image_file:
+    if search:
+        mask = (
+            df["name"].str.contains(search, case=False, na=False)
+            | df["formula"].str.contains(search, case=False, na=False)
+            | df["smiles"].str.contains(search, case=False, na=False)
+        )
+        df = df[mask]
 
-        st.image(
-            image_file,
-            use_container_width=True
+    st.write(f"عدد النتائج: {len(df)}")
+
+    st.dataframe(
+        df[
+            [
+                "id", "name", "category",
+                "formula", "molecular_weight"
+            ]
+        ],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# -------------------------------
+# تفاصيل المركب
+# -------------------------------
+
+elif page == "Compound Details":
+
+    st.header("🔬 Compound Analysis")
+
+    df = get_compounds()
+
+    if len(df) == 0:
+        st.warning("لا توجد مركبات.")
+    else:
+        selected = st.selectbox(
+            "اختر المركب",
+            df["id"].tolist(),
+            format_func=lambda x: df.loc[
+                df["id"] == x, "name"
+            ].iloc[0]
         )
 
-        if st.button("SCAN NOW", type="primary"):
+        compound = get_compound(selected)
 
-            try:
+        if compound:
+            st.subheader(compound[1])
+            st.write("**Category:**", compound[2])
 
-                results = read_barcode(
-                    image_file.getvalue()
-                )
+            if st.button("جلب البيانات من PubChem"):
+                with st.spinner("جاري البحث في PubChem..."):
+                    data = get_pubchem_data(compound[1])
 
-                if not results:
-
-                    st.warning(
-                        "No QR Code or Barcode detected."
+                if data:
+                    save_pubchem_data(selected, data)
+                    st.success("تم تحديث بيانات المركب.")
+                    st.rerun()
+                else:
+                    st.error(
+                        "لم يتم العثور على بيانات. "
+                        "تحقق من الاتصال بالإنترنت أو اسم المركب."
                     )
 
-                for item in results:
+            compound = get_compound(selected)
 
-                    code = item["code"]
-                    barcode_format = item["format"]
+            st.divider()
 
-                    record_scan(code, barcode_format)
+            col1, col2 = st.columns(2)
 
-                    st.success("Code detected successfully!")
+            col1.metric(
+                "Molecular Formula",
+                compound[3] or "Not available"
+            )
 
-                    st.write("Format:", barcode_format)
+            col2.metric(
+                "Molecular Weight",
+                compound[4] or "Not available"
+            )
 
-                    st.code(code)
+            st.write("**SMILES:**")
+            st.code(compound[5] or "Not available")
 
-                    sample = find_sample(code)
+            st.write("**IUPAC Name:**")
+            st.write(compound[7] or "Not available")
 
-                    if sample:
+            if compound[6]:
+                image_url = (
+                    "https://pubchem.ncbi.nlm.nih.gov/rest/pug/"
+                    f"compound/cid/{compound[6]}/PNG"
+                )
 
-                        st.subheader("Sample Information")
+                try:
+                    image_response = requests.get(
+                        image_url,
+                        timeout=15
+                    )
 
-                        st.write("Sample Name:", sample[2])
-                        st.write("Category:", sample[3])
-                        st.write("Source:", sample[4])
-                        st.write("Description:", sample[5])
-                        st.write("Registration Date:", sample[6])
-
-                    else:
-
-                        st.warning(
-                            "This code is not registered."
+                    if image_response.status_code == 200:
+                        st.image(
+                            image_response.content,
+                            caption="Chemical Structure",
+                            width=300
                         )
-
-                        st.session_state["new_code"] = code
-
-            except Exception as error:
-
-                st.error(f"Scanner error: {error}")
+                except Exception:
+                    st.info("تعذر تحميل صورة التركيب الكيميائي.")
 
 
-# =====================================
-# 8. REGISTER BIOLOGICAL SAMPLE
-# =====================================
+# -------------------------------
+# إضافة مركب جديد
+# -------------------------------
 
-elif page == "Register Sample":
+elif page == "Add Compound":
 
-    st.header("➕ Register Biological Sample")
+    st.header("➕ Add New Compound")
 
-    with st.form("sample_registration"):
+    with st.form("add_compound_form"):
 
-        code = st.text_input(
-            "Sample Code",
-            value=st.session_state.get("new_code", "")
-        )
-
-        name = st.text_input("Sample Name")
+        name = st.text_input("Compound Name")
 
         category = st.selectbox(
-            "Biological Category",
+            "Category",
             [
-                "Blood",
-                "Urine",
-                "Saliva",
-                "Tissue",
-                "Bacteria",
-                "Fungi",
-                "Plant",
-                "Other"
+                "Organic Chemistry",
+                "Inorganic Chemistry",
+                "Biochemistry"
             ]
         )
 
-        source = st.text_input("Sample Source")
+        formula = st.text_input("Molecular Formula")
+        weight = st.text_input("Molecular Weight")
+        smiles = st.text_input("SMILES")
+        description = st.text_area("Description")
 
-        description = st.text_area(
-            "Scientific Description"
-        )
+        submitted = st.form_submit_button("Save Compound")
 
-        submit = st.form_submit_button(
-            "REGISTER SAMPLE"
-        )
+        if submitted:
+            if not name.strip():
+                st.error("اكتب اسم المركب أولاً.")
+            else:
+                try:
+                    conn = connect_db()
+                    conn.execute("""
+                        INSERT INTO compounds
+                        (name, category, formula,
+                         molecular_weight, smiles, description)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        name.strip(),
+                        category,
+                        formula,
+                        weight,
+                        smiles,
+                        description
+                    ))
 
-        if submit:
+                    conn.commit()
+                    conn.close()
 
-            try:
+                    st.success("تمت إضافة المركب بنجاح.")
+                    st.rerun()
 
-                add_sample(
-                    code,
-                    name,
-                    category,
-                    source,
-                    description
-                )
-
-                st.success(
-                    "Sample registered successfully!"
-                )
-
-                st.session_state.pop("new_code", None)
-
-            except sqlite3.IntegrityError:
-
-                st.error(
-                    "This sample code already exists."
-                )
-
-            except ValueError as error:
-
-                st.error(str(error))
+                except sqlite3.IntegrityError:
+                    st.error("هذا المركب موجود بالفعل.")
 
 
-# =====================================
-# 9. BIOLOGICAL DATABASE
-# =====================================
+# -------------------------------
+# QR Code Generator
+# -------------------------------
 
-elif page == "Biological Database":
+elif page == "QR Generator":
 
-    st.header("🧫 Biological Sample Database")
+    st.header("📱 Compound QR Generator")
 
-    search = st.text_input(
-        "Search by code, name or category"
+    df = get_compounds()
+
+    selected = st.selectbox(
+        "اختر المركب",
+        df["id"].tolist(),
+        format_func=lambda x: df.loc[
+            df["id"] == x, "name"
+        ].iloc[0]
     )
 
-    data = get_samples(search)
+    compound = get_compound(selected)
 
+    if compound:
+        qr_text = f"BIOSCAN:{compound[0]}"
+
+        qr = qrcode.QRCode(
+            version=1,
+            box_size=10,
+            border=4
+        )
+
+        qr.add_data(qr_text)
+        qr.make(fit=True)
+
+        qr_image = qr.make_image(
+            fill_color="black",
+            back_color="white"
+        )
+
+        buffer = io.BytesIO()
+        qr_image.save(buffer, format="PNG")
+
+        st.image(
+            buffer.getvalue(),
+            caption=compound[1],
+            width=250
+        )
+
+        st.download_button(
+            "Download QR Code",
+            data=buffer.getvalue(),
+            file_name=f"BioScan_{compound[0]}.png",
+            mime="image/png"
+        )
+
+
+# -------------------------------
+# QR / Barcode Scanner
+# -------------------------------
+
+elif page == "QR / Barcode Scanner":
+
+    st.header("📷 QR / Barcode Scanner")
+
+    uploaded = st.file_uploader(
+        "ارفع صورة تحتوي على QR Code أو Barcode",
+        type=["png", "jpg", "jpeg"]
+    )
+
+    if not SCANNER_AVAILABLE:
+        st.warning(
+            "مكتبة zxing-cpp غير متاحة حاليًا. "
+            "يمكنك استخدام البحث اليدوي."
+        )
+
+    if uploaded and SCANNER_AVAILABLE:
+
+        image = Image.open(uploaded).convert("RGB")
+        st.image(image, caption="Uploaded Image", width=300)
+
+        if st.button("Scan Code"):
+
+            results = zxingcpp.read_barcodes(image)
+
+            if not results:
+                st.error("لم يتم العثور على رمز.")
+            else:
+                for result in results:
+                    scanned_text = result.text
+
+                    st.success(
+                        f"تمت قراءة الرمز: {scanned_text}"
+                    )
+
+                    if scanned_text.startswith("BIOSCAN:"):
+                        try:
+                            compound_id = int(
+                                scanned_text.split(":")[1]
+                            )
+
+                            compound = get_compound(compound_id)
+
+                            if compound:
+                                st.subheader(
+                                    "المركب المرتبط بالرمز"
+                                )
+                                st.write("Name:", compound[1])
+                                st.write("Category:", compound[2])
+                                st.write(
+                                    "Formula:",
+                                    compound[3] or "Not available"
+                                )
+                            else:
+                                st.warning(
+                                    "هذا الرمز غير مسجل في قاعدة البيانات."
+                                )
+
+                        except ValueError:
+                            st.error("صيغة الرمز غير صحيحة.")
+
+
+# -------------------------------
+# استيراد CSV
+# -------------------------------
+
+elif page == "Import CSV":
+
+    st.header("📂 Import Compounds from CSV")
+
+    st.write(
+        "يجب أن يحتوي الملف على الأعمدة التالية: "
+        "name, category, formula, molecular_weight, smiles"
+    )
+
+    uploaded_csv = st.file_uploader(
+        "اختر ملف CSV",
+        type=["csv"]
+    )
+
+    if uploaded_csv:
+
+        try:
+            csv_df = pd.read_csv(uploaded_csv)
+
+            st.dataframe(
+                csv_df.head(),
+                use_container_width=True
+            )
+
+            if st.button("Import Data"):
+
+                required = [
+                    "name",
+                    "category",
+                    "formula",
+                    "molecular_weight",
+                    "smiles"
+                ]
+
+                if not all(
+                    column in csv_df.columns
+                    for column in required
+                ):
+                    st.error("الأعمدة المطلوبة غير مكتملة.")
+                else:
+                    conn = connect_db()
+
+                    for _, row in csv_df.iterrows():
+                        conn.execute("""
+                            INSERT OR IGNORE INTO compounds
+                            (name, category, formula,
+                             molecular_weight, smiles)
+                            VALUES (?, ?, ?, ?, ?)
+                        """, (
+                            str(row["name"]),
+                            str(row["category"]),
+                            str(row["formula"]),
+                            str(row["molecular_weight"]),
+                            str(row["smiles"])
+                        ))
+
+                    conn.commit()
+                    conn.close()
+
+                    st.success("تم استيراد البيانات.")
+                    st.rerun()
+
+        except Exception as error:
+            st.error(f"حدث خطأ في قراءة الملف: {error}")
+
+
+# -------------------------------
+# العينات البيولوجية
+# -------------------------------
+
+elif page == "Biological Samples":
+
+    st.header("🦠 Biological Samples")
+
+    with st.form("sample_form"):
+
+        sample_name = st.text_input("Sample Name")
+        sample_code = st.text_input("Sample Code")
+        notes = st.text_area("Notes")
+
+        save_sample = st.form_submit_button(
+            "Register Sample"
+        )
+
+        if save_sample:
+
+            if sample_name.strip() and sample_code.strip():
+
+                conn = connect_db()
+
+                conn.execute("""
+                    INSERT INTO samples
+                    (sample_name, sample_code, notes)
+                    VALUES (?, ?, ?)
+                """, (
+                    sample_name,
+                    sample_code,
+                    notes
+                ))
+
+                conn.commit()
+                conn.close()
+
+                st.success("تم تسجيل العينة.")
+                st.rerun()
+
+            else:
+                st.error("أدخل اسم العينة ورمزها.")
+
+    conn = connect_db()
+
+    samples_df = pd.read_sql_query(
+        "SELECT * FROM samples ORDER BY id DESC",
+        conn
+    )
+
+    conn.close()
+
+    st.subheader("Registered Samples")
     st.dataframe(
-        data,
+        samples_df,
         use_container_width=True,
         hide_index=True
     )
 
-    st.caption(
-        f"Total matching records: {len(data)}"
-    )
 
-
-# =====================================
-# 10. SCAN HISTORY
-# =====================================
-
-elif page == "Scan History":
-
-    st.header("🕘 Scanner History")
-
-    with connect() as conn:
-
-        history = pd.read_sql_query("""
-            SELECT * FROM scan_history
-            ORDER BY id DESC
-        """, conn)
-
-    st.dataframe(
-        history,
-        use_container_width=True,
-        hide_index=True
-    )
-
-
-# =====================================
-# 11. ABOUT PROJECT
-# =====================================
-
-elif page == "About Project":
-
-    st.header("About BioScan Intelligence")
-
-    st.write("""
-    BioScan Intelligence is a research prototype
-    for biological sample identification and management.
-
-    Main Features:
-
-    1. QR Code Recognition
-    2. Barcode Recognition
-    3. Biological Sample Registration
-    4. Sample Database
-    5. Scan History
-    6. Sample Information Retrieval
-
-    Scientific Limitation:
-
-    The scanner reads encoded identification data.
-    It does not perform laboratory analysis,
-    microorganism detection or medical diagnosis.
-    """)
-
-    st.info(
-        "Developed using Python, Streamlit and Python libraries."
-    )
-
-
-# =====================================
-# 12. FOOTER
-# =====================================
+# -------------------------------
+# نهاية التطبيق
+# -------------------------------
 
 st.divider()
 
 st.caption(
-    "BioScan Intelligence | Research Project | Version 1.0"
-)
+    "BioScan Intelligence | Educational Chemical Database"
+    )
