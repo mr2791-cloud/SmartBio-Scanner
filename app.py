@@ -8,6 +8,14 @@ from PIL import Image
 from io import BytesIO
 from datetime import datetime
 
+hide_streamlit_style = """
+<style>
+#MainMenu {visibility: hidden;}
+footer {visibility: hidden;}
+header {visibility: hidden;}
+</style>
+"""
+st.markdown(hide_streamlit_style, unsafe_allow_html=True)
 # =====================================
 # 1. APPLICATION CONFIGURATION
 # =====================================
